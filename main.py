@@ -21,6 +21,7 @@ import os
 import sys
 import struct
 import subprocess
+import time
 from typing import Iterable, Optional
 
 # Takes 0.0..1.0, 0.5 being sRGB 0.5..1.0 being "boosted"
@@ -84,53 +85,46 @@ class Plugin:
             self._sleep_monitor_task = None
 
     async def _monitor_sleep(self):
-        """Watch org.freedesktop.login1 PrepareForSleep via gdbus monitor.
+        """Detect resume-from-suspend by comparing monotonic vs boottime.
 
-        gdbus monitor prints one line per signal, e.g.:
-            /org/freedesktop/login1: org.freedesktop.login1.Manager.PrepareForSleep (false,)
-
-        When the boolean is false, the system has just resumed -- that's
-        when we need to re-push our xprops, because gamescope resets them.
+        On Linux, CLOCK_MONOTONIC is paused while the system is suspended,
+        but CLOCK_BOOTTIME keeps advancing. By polling both and comparing
+        the deltas we can reliably detect a suspend/resume cycle without
+        depending on any external binaries, the Steam Client, dbus, or
+        elevated permissions.
         """
+        POLL_INTERVAL = 1.0
+        # Any gap greater than the poll interval + this slack is assumed
+        # to be a suspend cycle.
+        SUSPEND_SLACK = 2.0
+
+        prev_mono = time.monotonic()
+        prev_boot = time.clock_gettime(time.CLOCK_BOOTTIME)
         while True:
-            proc = None
             try:
-                proc = await asyncio.create_subprocess_exec(
-                    "gdbus", "monitor",
-                    "--system",
-                    "--dest", "org.freedesktop.login1",
-                    "--object-path", "/org/freedesktop/login1",
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.DEVNULL,
-                )
-                assert proc.stdout is not None
-                while True:
-                    raw = await proc.stdout.readline()
-                    if not raw:
-                        break
-                    line = raw.decode("utf-8", errors="ignore")
-                    if "PrepareForSleep" not in line:
-                        continue
-                    if "(false," in line:
-                        # Resumed. Re-apply with retries to outlast
-                        # gamescope re-initialising its color state.
-                        asyncio.create_task(self._reapply_with_retries())
-                # gdbus exited; loop and relaunch after a short delay
+                await asyncio.sleep(POLL_INTERVAL)
+                mono = time.monotonic()
+                boot = time.clock_gettime(time.CLOCK_BOOTTIME)
+                mono_delta = mono - prev_mono
+                boot_delta = boot - prev_boot
+                prev_mono = mono
+                prev_boot = boot
+                if boot_delta - mono_delta > SUSPEND_SLACK:
+                    print(
+                        f"vibrantDeck: resume detected "
+                        f"(suspended for ~{boot_delta - mono_delta:.1f}s), "
+                        f"re-applying color settings",
+                        file=sys.stderr,
+                    )
+                    asyncio.create_task(self._reapply_with_retries())
             except asyncio.CancelledError:
-                if proc is not None:
-                    try:
-                        proc.kill()
-                    except ProcessLookupError:
-                        pass
                 raise
             except Exception as e:
-                print(f"vibrantDeck: sleep monitor error: {e}", file=sys.stderr)
-            if proc is not None:
-                try:
-                    proc.kill()
-                except ProcessLookupError:
-                    pass
-            await asyncio.sleep(2)
+                print(
+                    f"vibrantDeck: sleep monitor error: {e}",
+                    file=sys.stderr,
+                )
+                await asyncio.sleep(2)
 
     async def _reapply_with_retries(self):
         """Re-push the last applied xprops several times after resume.
