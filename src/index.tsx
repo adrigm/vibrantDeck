@@ -325,6 +325,17 @@ export default definePlugin((serverAPI: ServerAPI) => {
   runningApps.listenActiveChange(() => applySettings(RunningApps.active()));
   listenForRunningApps(settings.enabled);
 
+  // Re-apply settings when resuming from suspend, since the compositor
+  // state is reset and our values would otherwise be lost until the user
+  // re-opens the plugin UI.
+  const resumeRegistration = (
+    SteamClient as any
+  )?.System?.RegisterForOnResumeFromSuspend?.(() => {
+    if (settings.enabled) {
+      applySettings(RunningApps.active());
+    }
+  });
+
   return {
     title: <div className={staticClasses.Title}>vibrantDeck</div>,
     content: (
@@ -337,6 +348,7 @@ export default definePlugin((serverAPI: ServerAPI) => {
     icon: <FaEyeDropper />,
     onDismount() {
       runningApps.unregister();
+      resumeRegistration?.unregister?.();
       // reset color settings to default values
       resetSettings();
     },
