@@ -325,16 +325,32 @@ export default definePlugin((serverAPI: ServerAPI) => {
   runningApps.listenActiveChange(() => applySettings(RunningApps.active()));
   listenForRunningApps(settings.enabled);
 
-  // Re-apply settings when resuming from suspend, since the compositor
-  // state is reset and our values would otherwise be lost until the user
-  // re-opens the plugin UI.
+  // Re-apply settings when resuming from suspend, since gamescope resets
+  // its color xprops on resume and our values would otherwise be lost
+  // until the user re-opens the plugin UI.
+  //
+  // Gamescope is not necessarily ready the instant the resume callback
+  // fires, so we reapply several times with increasing delays to make
+  // sure our values stick.
+  const reapplyAfterResume = () => {
+    if (!settings.enabled) return;
+    const delays = [500, 1500, 3000, 5000];
+    for (const delay of delays) {
+      setTimeout(() => {
+        if (settings.enabled) applySettings(RunningApps.active());
+      }, delay);
+    }
+  };
+
   const resumeRegistration = (
     SteamClient as any
-  )?.System?.RegisterForOnResumeFromSuspend?.(() => {
-    if (settings.enabled) {
-      applySettings(RunningApps.active());
-    }
-  });
+  )?.System?.RegisterForOnResumeFromSuspend?.(reapplyAfterResume);
+
+  // Some Steam client builds expose the suspend lifecycle under a
+  // different name; register for it too if available.
+  const resumeRegistration2 = (
+    SteamClient as any
+  )?.System?.RegisterForOnResumeFromStandby?.(reapplyAfterResume);
 
   return {
     title: <div className={staticClasses.Title}>vibrantDeck</div>,
@@ -349,6 +365,7 @@ export default definePlugin((serverAPI: ServerAPI) => {
     onDismount() {
       runningApps.unregister();
       resumeRegistration?.unregister?.();
+      resumeRegistration2?.unregister?.();
       // reset color settings to default values
       resetSettings();
     },
