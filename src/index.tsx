@@ -219,7 +219,7 @@ const Content: VFC<{
               description="Control the color saturation of the display"
               value={currentTargetVibrancy}
               step={1}
-              max={200}
+              max={400}
               min={0}
               showValue={true}
               onChange={(vibrancy: number) => {

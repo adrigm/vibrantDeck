@@ -58,7 +58,7 @@ class Plugin:
 
     async def set_vibrancy(self, vibrancy: float):
         vibrancy = max(vibrancy, 0.0)
-        vibrancy = min(vibrancy, 1.0)
+        vibrancy = min(vibrancy, 2.0)
 
         return set_cardinal_prop(SDR_GAMUT_PROP, [float_to_long(vibrancy)])
 
