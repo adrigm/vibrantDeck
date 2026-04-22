@@ -16,11 +16,13 @@ You should have received a copy of the GNU General Public License
 along with this program.  If not, see <https://www.gnu.org/licenses/>.
 """
 
+import asyncio
 import os
 import sys
 import struct
 import subprocess
-from typing import Iterable
+import time
+from typing import Iterable, Optional
 
 # Takes 0.0..1.0, 0.5 being sRGB 0.5..1.0 being "boosted"
 SDR_GAMUT_PROP = "GAMESCOPE_COLOR_SDR_GAMUT_WIDENESS"
@@ -56,10 +58,108 @@ def set_cardinal_prop(prop_name: str, values: Iterable[int]):
 
 class Plugin:
 
+    # Last values actually applied to gamescope. These are cached so that
+    # we can re-apply them after resuming from suspend without requiring
+    # the frontend UI to be mounted.
+    _last_vibrancy: Optional[float] = None
+    _last_brightness: Optional[float] = None
+    _last_color_temperature: Optional[int] = None
+    _last_color_intensity: Optional[float] = None
+
+    _sleep_monitor_task: Optional[asyncio.Task] = None
+
+    async def _main(self):
+        # Valve removed SteamClient.System.RegisterForOnResumeFromSuspend
+        # from the Steam Client, so plugins can no longer rely on the
+        # frontend to detect resume. Instead, listen to logind's
+        # PrepareForSleep signal directly from the backend.
+        self._sleep_monitor_task = asyncio.create_task(self._monitor_sleep())
+
+    async def _unload(self):
+        if self._sleep_monitor_task is not None:
+            self._sleep_monitor_task.cancel()
+            try:
+                await self._sleep_monitor_task
+            except BaseException:
+                pass
+            self._sleep_monitor_task = None
+
+    async def _monitor_sleep(self):
+        """Detect resume-from-suspend by comparing monotonic vs boottime.
+
+        On Linux, CLOCK_MONOTONIC is paused while the system is suspended,
+        but CLOCK_BOOTTIME keeps advancing. By polling both and comparing
+        the deltas we can reliably detect a suspend/resume cycle without
+        depending on any external binaries, the Steam Client, dbus, or
+        elevated permissions.
+        """
+        POLL_INTERVAL = 1.0
+        # Any gap greater than the poll interval + this slack is assumed
+        # to be a suspend cycle.
+        SUSPEND_SLACK = 2.0
+
+        prev_mono = time.monotonic()
+        prev_boot = time.clock_gettime(time.CLOCK_BOOTTIME)
+        while True:
+            try:
+                await asyncio.sleep(POLL_INTERVAL)
+                mono = time.monotonic()
+                boot = time.clock_gettime(time.CLOCK_BOOTTIME)
+                mono_delta = mono - prev_mono
+                boot_delta = boot - prev_boot
+                prev_mono = mono
+                prev_boot = boot
+                if boot_delta - mono_delta > SUSPEND_SLACK:
+                    print(
+                        f"vibrantDeck: resume detected "
+                        f"(suspended for ~{boot_delta - mono_delta:.1f}s), "
+                        f"re-applying color settings",
+                        file=sys.stderr,
+                    )
+                    asyncio.create_task(self._reapply_with_retries())
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                print(
+                    f"vibrantDeck: sleep monitor error: {e}",
+                    file=sys.stderr,
+                )
+                await asyncio.sleep(2)
+
+    async def _reapply_with_retries(self):
+        """Re-push the last applied xprops several times after resume.
+
+        Gamescope may not be ready the instant logind fires the resume
+        signal, and it may clobber our values during its own re-init. A
+        few staggered re-applications make sure our settings stick.
+        """
+        for delay in (0.3, 1.0, 2.5, 5.0, 8.0):
+            await asyncio.sleep(delay)
+            self._apply_last_values()
+
+    def _apply_last_values(self):
+        if self._last_vibrancy is not None:
+            set_cardinal_prop(SDR_GAMUT_PROP,
+                              [float_to_long(self._last_vibrancy)])
+        if self._last_brightness is not None:
+            set_cardinal_prop(SDR_INPUT_GAIN_PROP,
+                              [float_to_long(self._last_brightness)])
+        if (self._last_color_temperature is not None
+                and self._last_color_intensity is not None):
+            hue = (self._last_color_temperature / 100.0) * 0.083
+            amount = self._last_color_intensity
+            saturation = 1.0
+            set_cardinal_prop(NIGHT_MODE_PROP, [
+                float_to_long(amount),
+                float_to_long(hue),
+                float_to_long(saturation),
+            ])
+
     async def set_vibrancy(self, vibrancy: float):
         vibrancy = max(vibrancy, 0.0)
-        vibrancy = min(vibrancy, 1.0)
+        vibrancy = min(vibrancy, 2.0)
 
+        self._last_vibrancy = vibrancy
         return set_cardinal_prop(SDR_GAMUT_PROP, [float_to_long(vibrancy)])
 
     async def get_vibrancy(self) -> float:
@@ -93,6 +193,7 @@ class Plugin:
         brightness = max(brightness, 0.5)
         brightness = min(brightness, 2.0)
 
+        self._last_brightness = brightness
         return set_cardinal_prop(SDR_INPUT_GAIN_PROP, [float_to_long(brightness)])
 
     async def set_color_temperature(self, temperature: int, intensity: float):
@@ -105,24 +206,27 @@ class Plugin:
         """
         # Clamp temperature to valid range
         temperature = max(-100, min(100, temperature))
-        
+
         # Map temperature (-100 to +100) to hue rotation
         # We use a smaller range to avoid extreme color shifts
         # -100 = -0.083 (30° warm shift)
         # +100 = +0.083 (30° cool shift)
         hue = (temperature / 100.0) * 0.083
-        
+
         # Clamp intensity
         amount = max(0.0, min(1.0, intensity))
-        
+
+        self._last_color_temperature = temperature
+        self._last_color_intensity = amount
+
         # Saturation at 1.0 maintains color intensity during hue shift
         saturation = 1.0
-        
+
         # Night mode expects 3 floats: [amount, hue, saturation]
         values = [
             float_to_long(amount),
             float_to_long(hue),
             float_to_long(saturation)
         ]
-        
+
         return set_cardinal_prop(NIGHT_MODE_PROP, values)
